@@ -1,0 +1,20 @@
+services:
+  notifier:
+    build: .
+    volumes:
+      - ./config.json:/app/config/config.json:ro
+      - ./posts:/app/posts
+      - ./seen_posts.json:/app/seen_posts.json
+    restart: unless-stopped
+
+  # Scheduler to run notifier every 30 minutes
+  scheduler:
+    image: mcuadros/ofelia:latest
+    depends_on:
+      - notifier
+    command: daemon --docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - "ofelia.job-run.notifier.schedule=@every 30m"
+      - "ofelia.job-run.notifier.container=fb-notifier-notifier-1"
