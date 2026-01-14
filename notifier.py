@@ -100,12 +100,34 @@ def extract_text(html_content: str) -> str:
     return soup.get_text(separator='\n', strip=True)
 
 
+def sanitize_for_header(text: str) -> str:
+    """Sanitize text for use in HTTP headers (ASCII only)."""
+    # Replace common Unicode characters with ASCII equivalents
+    replacements = {
+        '\u2019': "'",   # Right single quote
+        '\u2018': "'",   # Left single quote
+        '\u201c': '"',   # Left double quote
+        '\u201d': '"',   # Right double quote
+        '\u2013': '-',   # En dash
+        '\u2014': '--',  # Em dash
+        '\u2026': '...', # Ellipsis
+    }
+    for unicode_char, ascii_char in replacements.items():
+        text = text.replace(unicode_char, ascii_char)
+
+    # Remove any remaining non-ASCII characters
+    return text.encode('ascii', 'ignore').decode('ascii')
+
+
 def send_ntfy_notification(config: Config, title: str, message: str, url: Optional[str] = None, image_url: Optional[str] = None):
     """Send a push notification via ntfy."""
     ntfy_url = f"{config.ntfy_server}/{config.ntfy_topic}"
 
+    # Sanitize title for HTTP headers (must be ASCII)
+    safe_title = sanitize_for_header(title[:256])
+
     headers = {
-        "Title": title[:256],  # ntfy title limit
+        "Title": safe_title,
         "Tags": "running,facebook,parkrun",
     }
 
@@ -123,7 +145,7 @@ def send_ntfy_notification(config: Config, title: str, message: str, url: Option
             timeout=10
         )
         response.raise_for_status()
-        logger.info(f"Notification sent: {title}")
+        logger.info(f"Notification sent: {safe_title}")
 
     except Exception as e:
         logger.error(f"Failed to send notification: {e}")
@@ -166,7 +188,7 @@ def process_feed(config: Config, seen_posts: SeenPosts):
         images = extract_images(content_html)
 
         # Send notification
-        title = f"🏃 Newark Parkrun: {getattr(entry, 'title', 'New Post')[:50]}"
+        title = f"Newark Parkrun: {getattr(entry, 'title', 'New Post')[:50]}"
         message = text[:500] + ("..." if len(text) > 500 else "")
 
         send_ntfy_notification(
