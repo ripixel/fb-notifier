@@ -1,6 +1,6 @@
 {
-  "rss_url": "YOUR_FETCHRSS_URL_HERE",
-  "ntfy_topic": "newark-parkrun-fb",
+  "facebook_page": "your-facebook-page-name",
+  "ntfy_topic": "your-ntfy-topic",
   "ntfy_server": "https://ntfy.sh",
   "seen_posts_file": "./seen_posts.json"
 }

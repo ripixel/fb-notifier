@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Facebook Page Notifier for Newark Parkrun
-Monitors an RSS feed (generated from Facebook) and sends push notifications via ntfy.
+Uses Playwright headless browser to scrape public Facebook page posts.
+Sends push notifications via ntfy for new posts.
 """
 
 import json
@@ -9,12 +10,12 @@ import os
 import sys
 import hashlib
 import logging
+import re
+import asyncio
 from pathlib import Path
 from typing import Optional
 
-import feedparser
 import requests
-from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(
@@ -41,7 +42,7 @@ class Config:
         with open(self.config_path) as f:
             data = json.load(f)
 
-        self.rss_url = data["rss_url"]
+        self.facebook_page = data.get("facebook_page", "newarkparkrun")
         self.ntfy_topic = data["ntfy_topic"]
         self.ntfy_server = data.get("ntfy_server", "https://ntfy.sh")
         self.seen_posts_file = Path(data.get("seen_posts_file", "./seen_posts.json"))
@@ -72,50 +73,54 @@ class SeenPosts:
         self.seen.add(post_id)
 
 
-def generate_post_id(entry) -> str:
-    """Generate a unique ID for a post based on its content."""
-    if hasattr(entry, 'id') and entry.id:
-        return entry.id
+def generate_post_id(post_url: str, text: str) -> str:
+    """Generate a unique ID for a post based on its content.
 
-    content = f"{getattr(entry, 'link', '')}{getattr(entry, 'title', '')}"
-    return hashlib.md5(content.encode()).hexdigest()
+    Uses text content hash as primary identifier since Facebook post URLs
+    can vary between scrapes (different query params, redirect URLs, etc).
+    """
+    # Primary: Use first 200 chars of text content as the stable identifier
+    # This is more reliable than URLs which can change
+    if text and len(text) >= 20:
+        text_id = hashlib.md5(text[:200].encode()).hexdigest()
+        logger.debug(f"Generated text-based post ID: {text_id[:12]}... from: {text[:50]}")
+        return text_id
 
+    # Fallback: Try to extract post ID from URL
+    for pattern in [
+        r'/posts/pfbid(\w+)',
+        r'/posts/(\d+)',
+        r'story_fbid=(\d+)',
+        r'fbid=(\d+)',
+        r'/permalink/(\d+)',
+    ]:
+        match = re.search(pattern, post_url)
+        if match:
+            url_id = match.group(1)
+            logger.debug(f"Generated URL-based post ID: {url_id}")
+            return url_id
 
-def extract_images(html_content: str) -> list[str]:
-    """Extract image URLs from HTML content."""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    images = []
-
-    for img in soup.find_all('img'):
-        src = img.get('src')
-        if src and not src.startswith('data:'):
-            images.append(src)
-
-    return images
-
-
-def extract_text(html_content: str) -> str:
-    """Extract clean text from HTML content."""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    return soup.get_text(separator='\n', strip=True)
+    # Last resort: hash URL + text
+    content = f"{post_url}{text[:100]}"
+    fallback_id = hashlib.md5(content.encode()).hexdigest()
+    logger.debug(f"Generated fallback post ID: {fallback_id[:12]}...")
+    return fallback_id
 
 
 def sanitize_for_header(text: str) -> str:
     """Sanitize text for use in HTTP headers (ASCII only)."""
-    # Replace common Unicode characters with ASCII equivalents
     replacements = {
-        '\u2019': "'",   # Right single quote
-        '\u2018': "'",   # Left single quote
-        '\u201c': '"',   # Left double quote
-        '\u201d': '"',   # Right double quote
-        '\u2013': '-',   # En dash
-        '\u2014': '--',  # Em dash
-        '\u2026': '...', # Ellipsis
+        '\u2019': "'",
+        '\u2018': "'",
+        '\u201c': '"',
+        '\u201d': '"',
+        '\u2013': '-',
+        '\u2014': '--',
+        '\u2026': '...',
     }
     for unicode_char, ascii_char in replacements.items():
         text = text.replace(unicode_char, ascii_char)
 
-    # Remove any remaining non-ASCII characters
     return text.encode('ascii', 'ignore').decode('ascii')
 
 
@@ -123,7 +128,6 @@ def send_ntfy_notification(config: Config, title: str, message: str, url: Option
     """Send a push notification via ntfy."""
     ntfy_url = f"{config.ntfy_server}/{config.ntfy_topic}"
 
-    # Sanitize title for HTTP headers (must be ASCII)
     safe_title = sanitize_for_header(title[:256])
 
     headers = {
@@ -140,7 +144,7 @@ def send_ntfy_notification(config: Config, title: str, message: str, url: Option
     try:
         response = requests.post(
             ntfy_url,
-            data=message[:4096].encode('utf-8'),  # ntfy message limit
+            data=message[:4096].encode('utf-8'),
             headers=headers,
             timeout=10
         )
@@ -152,60 +156,145 @@ def send_ntfy_notification(config: Config, title: str, message: str, url: Option
         raise
 
 
-def process_feed(config: Config, seen_posts: SeenPosts):
-    """Fetch and process the RSS feed."""
-    logger.info(f"Fetching feed: {config.rss_url}")
+async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
+    """
+    Scrape posts from Facebook page using Playwright headless browser.
+    Returns list of dicts with: post_url, text, image_url
+    """
+    from playwright.async_api import async_playwright
 
-    feed = feedparser.parse(config.rss_url)
+    url = f"https://www.facebook.com/{page_name}"
+    posts = []
 
-    if feed.bozo:
-        logger.warning(f"Feed parsing warning: {feed.bozo_exception}")
+    logger.info(f"Opening Facebook page with headless browser: {url}")
 
-    if not feed.entries:
-        logger.info("No entries in feed")
+    async with async_playwright() as p:
+        # Use Chromium headless
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport={'width': 1280, 'height': 800},
+            locale='en-US',
+        )
+        page = await context.new_page()
+
+        try:
+            # Navigate and wait for content
+            await page.goto(url, wait_until='networkidle', timeout=30000)
+
+            # Wait a bit for dynamic content to load
+            await page.wait_for_timeout(3000)
+
+            # Close any popups (login prompts, cookie banners)
+            try:
+                close_buttons = await page.query_selector_all('[aria-label="Close"], [data-testid="cookie-policy-manage-dialog-accept-button"]')
+                for btn in close_buttons:
+                    await btn.click()
+                    await page.wait_for_timeout(500)
+            except:
+                pass
+
+            # Scroll down to load more posts
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            await page.wait_for_timeout(2000)
+
+            # Extract posts - Facebook uses role="article" for posts
+            post_elements = await page.query_selector_all('[role="article"]')
+            logger.info(f"Found {len(post_elements)} post elements")
+
+            for post_elem in post_elements[:10]:  # Limit to recent posts
+                try:
+                    # Get post text
+                    text_elem = await post_elem.query_selector('[data-ad-preview="message"]')
+                    if not text_elem:
+                        text_elem = await post_elem.query_selector('[dir="auto"]')
+
+                    text = ""
+                    if text_elem:
+                        text = await text_elem.inner_text()
+
+                    if len(text) < 10:
+                        continue
+
+                    # Get post link
+                    post_url = f"https://www.facebook.com/{page_name}"
+                    link_elems = await post_elem.query_selector_all('a[href*="/posts/"], a[href*="permalink"]')
+                    for link in link_elems:
+                        href = await link.get_attribute('href')
+                        if href:
+                            if href.startswith('/'):
+                                post_url = f"https://www.facebook.com{href}"
+                            else:
+                                post_url = href
+                            break
+
+                    # Get first image
+                    image_url = None
+                    img_elem = await post_elem.query_selector('img[src*="scontent"]')
+                    if img_elem:
+                        image_url = await img_elem.get_attribute('src')
+
+                    posts.append({
+                        'post_url': post_url.split('?')[0],  # Clean URL
+                        'text': text[:1000],
+                        'image_url': image_url
+                    })
+
+                except Exception as e:
+                    logger.debug(f"Failed to parse post element: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Playwright scraping error: {e}")
+        finally:
+            await browser.close()
+
+    return posts
+
+
+def process_facebook_page(config: Config, seen_posts: SeenPosts):
+    """Scrape Facebook page and process new posts."""
+    logger.info(f"Checking Facebook page: {config.facebook_page}")
+
+    try:
+        posts = asyncio.run(scrape_facebook_with_playwright(config.facebook_page))
+    except Exception as e:
+        logger.error(f"Failed to scrape Facebook page: {e}")
+        raise
+
+    if not posts:
+        logger.info("No posts found on page")
         return
 
+    logger.info(f"Found {len(posts)} posts to check")
     new_posts = 0
 
-    for entry in feed.entries:
-        post_id = generate_post_id(entry)
+    # Process in reverse (oldest first) for chronological notifications
+    for post in reversed(posts):
+        post_id = generate_post_id(post['post_url'], post['text'])
 
         if seen_posts.is_seen(post_id):
+            logger.debug(f"Already seen post: {post_id}")
             continue
 
-        logger.info(f"New post found: {getattr(entry, 'title', 'Untitled')[:50]}")
+        # Create notification
+        first_line = post['text'].split('\n')[0][:50] if post['text'] else 'New Post'
+        title = f"Newark Parkrun: {first_line}"
+        message = post['text'][:500] + ("..." if len(post['text']) > 500 else "")
 
-        # Extract content
-        content_html = ""
-        if hasattr(entry, 'content') and entry.content:
-            content_html = entry.content[0].get('value', '')
-        elif hasattr(entry, 'summary'):
-            content_html = entry.summary
-        elif hasattr(entry, 'description'):
-            content_html = entry.description
-
-        text = extract_text(content_html)
-        images = extract_images(content_html)
-
-        # Send notification
-        title = f"Newark Parkrun: {getattr(entry, 'title', 'New Post')[:50]}"
-        message = text[:500] + ("..." if len(text) > 500 else "")
+        logger.info(f"New post found: {first_line}")
 
         send_ntfy_notification(
             config,
             title=title,
             message=message,
-            url=getattr(entry, 'link', None),
-            image_url=images[0] if images else None
+            url=post['post_url'],
+            image_url=post.get('image_url')
         )
 
-        # Mark as seen
         seen_posts.mark_seen(post_id)
         new_posts += 1
 
-    # Save seen posts
     seen_posts.save()
-
     logger.info(f"Processed {new_posts} new posts")
 
 
@@ -216,7 +305,7 @@ def main():
     try:
         config = Config(config_path)
         seen_posts = SeenPosts(config.seen_posts_file)
-        process_feed(config, seen_posts)
+        process_facebook_page(config, seen_posts)
 
     except FileNotFoundError as e:
         logger.error(str(e))
@@ -228,4 +317,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

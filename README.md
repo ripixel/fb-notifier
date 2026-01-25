@@ -1,10 +1,11 @@
 # Facebook Page Notifier for Newark Parkrun
 
-Monitor a Facebook page via RSS and receive push notifications when new posts appear. Designed for situations where you need to track Facebook updates without having a Facebook account.
+Monitor a Facebook page directly and receive push notifications when new posts appear. Designed for situations where you need to track Facebook updates without having a Facebook account.
 
 ## Features
 
-- 📰 Converts Facebook page to RSS via FetchRSS
+- 📰 **Direct scraping** - No RSS middleman, polls as frequently as you want (every 10-15 min recommended)
+- 🖥️ **Headless browser** - Uses Playwright to render the full Facebook page, bypassing anti-scraping measures
 - 📱 Push notifications via [ntfy](https://ntfy.sh)
 - 🔗 Tap notification to view original Facebook post
 - 🖼️ First image from post shown in notification
@@ -13,17 +14,17 @@ Monitor a Facebook page via RSS and receive push notifications when new posts ap
 
 ## Quick Start
 
-### 1. Create FetchRSS Feed
-
-1. Go to [FetchRSS](https://fetchrss.com)
-2. Enter the Facebook page URL: `https://www.facebook.com/newarkparkrun`
-3. Click "Create RSS"
-4. Copy the generated RSS URL
-
-### 2. Install ntfy App
+### 1. Install ntfy App
 
 1. Download [ntfy](https://ntfy.sh) on your phone (iOS/Android)
 2. Subscribe to topic: `newark-parkrun-fb` (or your custom topic)
+
+### 2. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
 
 ### 3. Configure
 
@@ -34,22 +35,38 @@ cp config.example.json config.json
 Edit `config.json`:
 ```json
 {
-  "rss_url": "YOUR_FETCHRSS_URL_HERE",
+  "facebook_page": "newarkparkrun",
   "ntfy_topic": "newark-parkrun-fb"
 }
 ```
+
+| Setting | Description |
+|---------|-------------|
+| `facebook_page` | The Facebook page name (from the URL) |
+| `ntfy_topic` | Your ntfy topic name |
+| `ntfy_server` | Optional, defaults to `https://ntfy.sh` |
+| `seen_posts_file` | Optional, defaults to `./seen_posts.json` |
 
 ### 4. Run
 
 **Option A: Python directly**
 ```bash
-pip install -r requirements.txt
 python notifier.py
 ```
 
 **Option B: Docker**
 ```bash
 docker compose up -d
+```
+
+## Polling Frequency
+
+Unlike FetchRSS (which updates every 24 hours 💀), this scrapes directly so you can poll as often as you like. Recommended: **every 10-15 minutes** to balance freshness vs. not hammering Facebook.
+
+Set up a cron job:
+```bash
+# Every 10 minutes
+*/10 * * * * cd /path/to/fb-notifier && /path/to/python notifier.py >> /var/log/fb-notifier.log 2>&1
 ```
 
 ## GCP Deployment
@@ -62,28 +79,49 @@ See [DEPLOY_GCP.md](./DEPLOY_GCP.md) for full instructions on deploying to Googl
 # Build and push
 gcloud builds submit --tag gcr.io/YOUR_PROJECT/fb-notifier
 
-# Create job (runs every 30 min)
+# Create job (runs every 10 min)
 gcloud run jobs create fb-notifier \
   --image gcr.io/YOUR_PROJECT/fb-notifier \
-  --region us-central1
+  --region us-central1 \
+  --memory 1Gi
 
-# Schedule
+# Schedule (every 10 minutes)
 gcloud scheduler jobs create http fb-notifier-scheduler \
-  --schedule="*/30 * * * *" \
+  --schedule="*/10 * * * *" \
   --uri="https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/YOUR_PROJECT/jobs/fb-notifier:run" \
   --http-method=POST \
   --oauth-service-account-email=YOUR_SERVICE_ACCOUNT
 ```
 
+**Note:** Playwright requires more memory than simple HTTP requests. Use at least 1Gi for Cloud Run.
+
 ## How It Works
 
-1. **FetchRSS** scrapes the public Facebook page and generates an RSS feed
-2. **notifier.py** polls the RSS feed periodically
-3. New posts are detected by comparing against previously seen posts
-4. For each new post:
+1. **Playwright** launches a headless Chromium browser
+2. Navigates to the public Facebook page and waits for content to load
+3. Extracts posts using DOM selectors
+4. New posts detected by comparing against previously seen posts
+5. For each new post:
    - Push notification sent via ntfy with post text
    - First image attached to notification
    - Tap notification to open original Facebook post
+
+## Troubleshooting
+
+**"Failed to scrape Facebook page"**
+- Facebook may have temporarily blocked requests. Wait a few minutes and try again.
+- Ensure the page name is correct (use the URL slug, e.g., `newarkparkrun` not the full URL)
+- Check that Playwright browsers are installed: `playwright install chromium`
+
+**No notifications received**
+- Check you're subscribed to the correct ntfy topic
+- Run manually to see logs: `python notifier.py`
+
+**"browserType.launch: Executable doesn't exist"**
+- Run `playwright install chromium` to download the browser
+
+**Memory issues on Cloud Run**
+- Increase memory allocation to at least 1Gi
 
 ## License
 

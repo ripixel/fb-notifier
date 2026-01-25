@@ -1,4 +1,5 @@
-FROM python:3.12-slim
+# Use Playwright's official image which includes Chromium and all dependencies
+FROM mcr.microsoft.com/playwright/python:v1.57.0-noble
 
 WORKDIR /app
 
