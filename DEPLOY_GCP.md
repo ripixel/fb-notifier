@@ -52,7 +52,7 @@ gcloud run jobs create fb-notifier \
   --image gcr.io/${PROJECT_ID}/fb-notifier \
   --region europe-west2 \
   --memory 256Mi \
-  --task-timeout 5m \
+  --task-timeout 5m \ 
   --set-env-vars FB_NOTIFIER_CONFIG=/app/config/config.json
 ```
 

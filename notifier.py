@@ -8,7 +8,6 @@ Sends push notifications via ntfy for new posts.
 import json
 import os
 import sys
-import hashlib
 import logging
 import re
 import asyncio
@@ -73,38 +72,22 @@ class SeenPosts:
         self.seen.add(post_id)
 
 
-def generate_post_id(post_url: str, text: str) -> str:
-    """Generate a unique ID for a post based on its content.
+def generate_post_id(post_url: str, text: str) -> Optional[str]:
+    """Extract the post ID from a Facebook permalink URL.
 
-    Uses text content hash as primary identifier since Facebook post URLs
-    can vary between scrapes (different query params, redirect URLs, etc).
+    Only accepts legitimate pfbid-prefixed IDs. Returns None if no valid ID found.
+    This prevents capturing photo IDs, story IDs, or generating unreliable text hashes.
     """
-    # Primary: Use first 200 chars of text content as the stable identifier
-    # This is more reliable than URLs which can change
-    if text and len(text) >= 20:
-        text_id = hashlib.md5(text[:200].encode()).hexdigest()
-        logger.debug(f"Generated text-based post ID: {text_id[:12]}... from: {text[:50]}")
-        return text_id
+    # Only match pfbid-prefixed post IDs (the modern Facebook standard)
+    match = re.search(r'/posts/(pfbid\w+)', post_url)
+    if match:
+        post_id = match.group(1)
+        logger.info(f"Found post ID: {post_id[:20]}...")
+        return post_id
 
-    # Fallback: Try to extract post ID from URL
-    for pattern in [
-        r'/posts/pfbid(\w+)',
-        r'/posts/(\d+)',
-        r'story_fbid=(\d+)',
-        r'fbid=(\d+)',
-        r'/permalink/(\d+)',
-    ]:
-        match = re.search(pattern, post_url)
-        if match:
-            url_id = match.group(1)
-            logger.debug(f"Generated URL-based post ID: {url_id}")
-            return url_id
-
-    # Last resort: hash URL + text
-    content = f"{post_url}{text[:100]}"
-    fallback_id = hashlib.md5(content.encode()).hexdigest()
-    logger.debug(f"Generated fallback post ID: {fallback_id[:12]}...")
-    return fallback_id
+    # No valid post ID found - this is not a legitimate post permalink
+    logger.debug(f"No pfbid found in URL: {post_url[:60]}...")
+    return None
 
 
 def sanitize_for_header(text: str) -> str:
@@ -186,61 +169,95 @@ async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
 
             # Close any popups (login prompts, cookie banners)
             try:
-                close_buttons = await page.query_selector_all('[aria-label="Close"], [data-testid="cookie-policy-manage-dialog-accept-button"]')
+                # Click "Allow all cookies" button if present
+                allow_cookies = page.get_by_role("button", name="Allow all cookies")
+                if await allow_cookies.count() > 0:
+                    await allow_cookies.click()
+                    logger.info("Clicked 'Allow all cookies' button")
+                    await page.wait_for_timeout(2000)
+
+                # Also close any other modals
+                close_buttons = await page.query_selector_all('[aria-label="Close"]')
                 for btn in close_buttons:
                     await btn.click()
                     await page.wait_for_timeout(500)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"No popup to close: {e}")
 
-            # Scroll down to load more posts
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            await page.wait_for_timeout(2000)
+            # Scroll down multiple times to load more posts
+            for scroll_num in range(3):
+                await page.evaluate(f"window.scrollTo(0, {(scroll_num + 1) * 500})")
+                await page.wait_for_timeout(1500)
 
-            # Extract posts - Facebook uses role="article" for posts
-            post_elements = await page.query_selector_all('[role="article"]')
-            logger.info(f"Found {len(post_elements)} post elements")
+            # Step 1: Find all unique post permalinks on the page
+            # Look for <a> tags whose href starts with the posts URL
+            posts_url_prefix = f"https://www.facebook.com/{page_name}/posts"
+            all_links = await page.query_selector_all('a[href]')
+            unique_hrefs = set()
 
-            for post_elem in post_elements[:10]:  # Limit to recent posts
+            for link in all_links:
+                href = await link.get_attribute('href')
+                if href and href.startswith(posts_url_prefix):
+                    # Clean the URL (remove query params)
+                    clean_href = href.split('?')[0]
+                    unique_hrefs.add(clean_href)
+
+            logger.info(f"Found {len(unique_hrefs)} unique post links")
+
+            if not unique_hrefs:
+                logger.warning("No post links found - Facebook may have changed their HTML")
+                return posts
+
+            # Step 2: For each unique post link, find its article and extract content
+            for post_url in list(unique_hrefs)[:10]:  # Limit to 10 posts
                 try:
-                    # Get post text
-                    text_elem = await post_elem.query_selector('[data-ad-preview="message"]')
-                    if not text_elem:
-                        text_elem = await post_elem.query_selector('[dir="auto"]')
+                    # Find the link element for this URL
+                    link_elem = await page.query_selector(f'a[href*="{post_url.split("/posts/")[1][:30]}"]')
+                    if not link_elem:
+                        continue
 
+                    # Navigate up to find the article container
+                    article = await link_elem.evaluate_handle('el => el.closest("[role=\\"article\\"]")')
+                    if not article:
+                        continue
+
+                    # Get post text - look for the main message content
                     text = ""
-                    if text_elem:
+                    text_elem = await article.query_selector('[data-ad-preview="message"]')
+                    if not text_elem:
+                        # Try getting text from dir="auto" elements that aren't just timestamps
+                        text_elems = await article.query_selector_all('[dir="auto"]')
+                        for te in text_elems:
+                            candidate = await te.inner_text()
+                            if len(candidate) > 20:  # Skip short timestamp texts
+                                text = candidate
+                                break
+                    else:
                         text = await text_elem.inner_text()
 
                     if len(text) < 10:
                         continue
 
-                    # Get post link
-                    post_url = f"https://www.facebook.com/{page_name}"
-                    link_elems = await post_elem.query_selector_all('a[href*="/posts/"], a[href*="permalink"]')
-                    for link in link_elems:
-                        href = await link.get_attribute('href')
-                        if href:
-                            if href.startswith('/'):
-                                post_url = f"https://www.facebook.com{href}"
-                            else:
-                                post_url = href
-                            break
-
-                    # Get first image
+                    # Get first image from the post
                     image_url = None
-                    img_elem = await post_elem.query_selector('img[src*="scontent"]')
+                    img_elem = await article.query_selector('img[src*="scontent"]')
                     if img_elem:
                         image_url = await img_elem.get_attribute('src')
 
+                    # Ensure full URL
+                    if not post_url.startswith('http'):
+                        post_url = f"https://www.facebook.com{post_url}"
+
+                    logger.info(f"Extracted post: {post_url[-40:]} - {text[:30]}...")
+
                     posts.append({
-                        'post_url': post_url.split('?')[0],  # Clean URL
+                        'post_url': post_url,
                         'text': text[:1000],
                         'image_url': image_url
                     })
 
                 except Exception as e:
-                    logger.debug(f"Failed to parse post element: {e}")
+                    logger.debug(f"Failed to parse post: {e}")
                     continue
 
         except Exception as e:
@@ -271,6 +288,11 @@ def process_facebook_page(config: Config, seen_posts: SeenPosts):
     # Process in reverse (oldest first) for chronological notifications
     for post in reversed(posts):
         post_id = generate_post_id(post['post_url'], post['text'])
+
+        # Skip posts without valid pfbid (e.g., photos, shared content)
+        if post_id is None:
+            logger.debug(f"Skipping post without valid pfbid: {post['post_url'][:50]}...")
+            continue
 
         if seen_posts.is_seen(post_id):
             logger.debug(f"Already seen post: {post_id}")
