@@ -11,6 +11,7 @@ import sys
 import logging
 import re
 import asyncio
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -235,9 +236,6 @@ async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
                     else:
                         text = await text_elem.inner_text()
 
-                    if len(text) < 10:
-                        continue
-
                     # Get first image from the post
                     image_url = None
                     img_elem = await article.query_selector('img[src*="scontent"]')
@@ -298,6 +296,11 @@ def process_facebook_page(config: Config, seen_posts: SeenPosts):
             logger.debug(f"Already seen post: {post_id}")
             continue
 
+        if len(post['text']) < 10:
+            logger.debug(f"Marking post seen without notification (no text): {post_id[:20]}...")
+            seen_posts.mark_seen(post_id)
+            continue
+
         # Create notification
         first_line = post['text'].split('\n')[0][:50] if post['text'] else 'New Post'
         title = f"Newark Parkrun: {first_line}"
@@ -323,18 +326,30 @@ def process_facebook_page(config: Config, seen_posts: SeenPosts):
 def main():
     """Main entry point."""
     config_path = os.environ.get("FB_NOTIFIER_CONFIG", "config.json")
+    run_once = "--once" in sys.argv
 
     try:
         config = Config(config_path)
         seen_posts = SeenPosts(config.seen_posts_file)
-        process_facebook_page(config, seen_posts)
-
     except FileNotFoundError as e:
         logger.error(str(e))
         sys.exit(1)
-    except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-        sys.exit(1)
+
+    if run_once:
+        try:
+            process_facebook_page(config, seen_posts)
+        except Exception as e:
+            logger.exception(f"Unexpected error: {e}")
+        return
+
+    while True:
+        try:
+            process_facebook_page(config, seen_posts)
+        except Exception as e:
+            logger.exception(f"Unexpected error: {e}")
+
+        logger.info("Sleeping 30 minutes until next check...")
+        time.sleep(30 * 60)
 
 
 if __name__ == "__main__":
