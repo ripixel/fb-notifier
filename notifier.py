@@ -149,18 +149,120 @@ def send_ntfy_notification(config: Config, title: str, message: str, url: Option
         raise
 
 
-async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
-    """
-    Scrape posts from Facebook page using Playwright headless browser.
-    Uses mbasic.facebook.com which is server-rendered and avoids JS-based bot detection.
-    Returns list of dicts with: post_url, text, image_url
-    """
+_MOBILE_UA = (
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) '
+    'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 '
+    'Mobile/15E148 Safari/604.1'
+)
+
+
+def _extract_posts_from_html(html: str, page_name: str) -> list[dict]:
+    """Parse mbasic Facebook HTML and return post dicts."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    unique_posts: dict[str, dict] = {}
+
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+
+        # pfbid format
+        m = re.search(r'/posts/(pfbid\w+)', href)
+        if m:
+            pid = m.group(1)
+            if pid not in unique_posts:
+                unique_posts[pid] = {
+                    'post_url': f"https://www.facebook.com/{page_name}/posts/{pid}",
+                    'anchor': a,
+                }
+            continue
+
+        # Numeric post path
+        m = re.search(rf'/{re.escape(page_name)}/posts/(\d+)', href)
+        if m:
+            pid = m.group(1)
+            if pid not in unique_posts:
+                unique_posts[pid] = {
+                    'post_url': f"https://www.facebook.com/{page_name}/posts/{pid}",
+                    'anchor': a,
+                }
+            continue
+
+        # story.php format
+        m = re.search(r'story_fbid=(\d+)', href)
+        if m:
+            pid = f"story_{m.group(1)}"
+            page_id_m = re.search(r'[?&]id=(\d+)', href)
+            if pid not in unique_posts:
+                if page_id_m:
+                    post_url = (
+                        f"https://www.facebook.com/story.php"
+                        f"?story_fbid={m.group(1)}&id={page_id_m.group(1)}"
+                    )
+                else:
+                    post_url = f"https://www.facebook.com/{page_name}/posts/{m.group(1)}"
+                unique_posts[pid] = {'post_url': post_url, 'anchor': a}
+
+    logger.info(f"Found {len(unique_posts)} unique post links in HTML")
+
+    posts = []
+    for pid, info in list(unique_posts.items())[:10]:
+        anchor = info['anchor']
+        # Walk up to the nearest block-level container with some substance
+        container = anchor
+        for _ in range(5):
+            parent = container.parent
+            if parent is None:
+                break
+            container = parent
+            text = container.get_text(separator=' ', strip=True)
+            if len(text) > 50:
+                break
+
+        text = container.get_text(separator='\n', strip=True)
+        img = container.find('img')
+        image_url = img['src'] if img and img.get('src') else None
+
+        logger.info(f"Post {pid[:20]}: {text[:60]}...")
+        posts.append({
+            'post_url': info['post_url'],
+            'text': text[:1000],
+            'image_url': image_url,
+        })
+
+    return posts
+
+
+def scrape_with_requests(page_name: str) -> list[dict]:
+    """Try fetching mbasic.facebook.com with a plain HTTP request (no browser)."""
+    url = f"https://mbasic.facebook.com/{page_name}"
+    logger.info(f"Attempting plain HTTP fetch: {url}")
+
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': _MOBILE_UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-GB,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+    })
+
+    resp = session.get(url, timeout=15, allow_redirects=True)
+    logger.info(f"HTTP response: {resp.status_code}, final URL: {resp.url}")
+
+    if 'login' in str(resp.url) or 'checkpoint' in str(resp.url):
+        logger.warning("Plain HTTP also hit login wall")
+        return []
+
+    return _extract_posts_from_html(resp.text, page_name)
+
+
+async def scrape_with_playwright(page_name: str) -> list[dict]:
+    """Fallback: use Playwright headless browser against mbasic.facebook.com."""
     from playwright.async_api import async_playwright
 
     url = f"https://mbasic.facebook.com/{page_name}"
     posts = []
-
-    logger.info(f"Opening Facebook page: {url}")
+    logger.info(f"Attempting Playwright fetch: {url}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -170,105 +272,21 @@ async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
         context = await browser.new_context(
             viewport={'width': 390, 'height': 844},
             locale='en-US',
-            user_agent=(
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) '
-                'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 '
-                'Mobile/15E148 Safari/604.1'
-            ),
+            user_agent=_MOBILE_UA,
         )
         page = await context.new_page()
 
         try:
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
             await page.wait_for_timeout(2000)
-
-            logger.info(f"Page loaded. URL: {page.url}")
+            logger.info(f"Playwright page URL: {page.url}")
 
             if 'login' in page.url or 'checkpoint' in page.url:
-                logger.warning(f"Redirected to login/checkpoint: {page.url}")
-                all_links = await page.query_selector_all('a[href]')
-                sample = [await l.get_attribute('href') or '' for l in all_links[:20]]
-                logger.warning(f"Sample hrefs: {sample}")
+                logger.warning(f"Playwright also hit login wall: {page.url}")
                 return posts
 
-            # Collect all post links — mbasic uses /posts/pfbid..., /posts/12345,
-            # and story.php?story_fbid=... formats
-            all_links = await page.query_selector_all('a[href]')
-            unique_posts: dict[str, str] = {}  # post_id -> canonical www URL
-
-            for link in all_links:
-                href = await link.get_attribute('href') or ''
-
-                # pfbid format: /newarkparkrun/posts/pfbid...
-                m = re.search(r'/posts/(pfbid\w+)', href)
-                if m:
-                    pid = m.group(1)
-                    unique_posts[pid] = f"https://www.facebook.com/{page_name}/posts/{pid}"
-                    continue
-
-                # Numeric post path: /newarkparkrun/posts/12345
-                m = re.search(rf'/{re.escape(page_name)}/posts/(\d+)', href)
-                if m:
-                    pid = m.group(1)
-                    unique_posts[pid] = f"https://www.facebook.com/{page_name}/posts/{pid}"
-                    continue
-
-                # story.php format
-                m = re.search(r'story_fbid=(\d+)', href)
-                if m:
-                    pid = f"story_{m.group(1)}"
-                    page_id_m = re.search(r'[?&]id=(\d+)', href)
-                    if page_id_m:
-                        unique_posts[pid] = (
-                            f"https://www.facebook.com/story.php"
-                            f"?story_fbid={m.group(1)}&id={page_id_m.group(1)}"
-                        )
-                    else:
-                        unique_posts[pid] = f"https://www.facebook.com/{page_name}/posts/{m.group(1)}"
-                    continue
-
-            logger.info(f"Found {len(unique_posts)} unique post links")
-
-            if not unique_posts:
-                page_title = await page.title()
-                logger.warning(f"No post links found. Title: '{page_title}', URL: {page.url}")
-                sample = [await l.get_attribute('href') or '' for l in all_links[:20]]
-                logger.warning(f"Sample hrefs: {sample}")
-                return posts
-
-            # Extract text and image for each post by finding the surrounding block
-            for pid, post_url in list(unique_posts.items())[:10]:
-                try:
-                    # Find the anchor for this post
-                    fragment = pid if pid.startswith('pfbid') else pid.replace('story_', '')
-                    link_elem = await page.query_selector(f'a[href*="{fragment[:30]}"]')
-
-                    text = ""
-                    image_url = None
-
-                    if link_elem:
-                        # Walk up to the nearest block that contains the post body.
-                        # mbasic wraps each post in a <div> with an id like "MCompositePost..."
-                        container = await link_elem.evaluate_handle(
-                            'el => el.closest("div[id]") || el.parentElement'
-                        )
-                        if container:
-                            text = (await container.inner_text() or "").strip()
-                            img = await container.query_selector('img')
-                            if img:
-                                image_url = await img.get_attribute('src')
-
-                    logger.info(f"Extracted post: {pid[:20]} - {text[:50]}...")
-
-                    posts.append({
-                        'post_url': post_url,
-                        'text': text[:1000],
-                        'image_url': image_url
-                    })
-
-                except Exception as e:
-                    logger.debug(f"Failed to parse post: {e}")
-                    continue
+            html = await page.content()
+            posts = _extract_posts_from_html(html, page_name)
 
         except Exception as e:
             logger.error(f"Playwright scraping error: {e}")
@@ -278,12 +296,22 @@ async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
     return posts
 
 
+def scrape_facebook_page(page_name: str) -> list[dict]:
+    """Try plain HTTP first; fall back to Playwright if blocked."""
+    posts = scrape_with_requests(page_name)
+    if posts:
+        return posts
+
+    logger.info("Plain HTTP returned no posts, falling back to Playwright")
+    return asyncio.run(scrape_with_playwright(page_name))
+
+
 def process_facebook_page(config: Config, seen_posts: SeenPosts):
     """Scrape Facebook page and process new posts."""
     logger.info(f"Checking Facebook page: {config.facebook_page}")
 
     try:
-        posts = asyncio.run(scrape_facebook_with_playwright(config.facebook_page))
+        posts = scrape_facebook_page(config.facebook_page)
     except Exception as e:
         logger.error(f"Failed to scrape Facebook page: {e}")
         raise
