@@ -46,6 +46,7 @@ class Config:
         self.ntfy_topic = data["ntfy_topic"]
         self.ntfy_server = data.get("ntfy_server", "https://ntfy.sh")
         self.seen_posts_file = Path(data.get("seen_posts_file", "./seen_posts.json"))
+        self.cookies_file = Path(data.get("cookies_file", "./cookies.json"))
 
 
 class SeenPosts:
@@ -149,6 +150,21 @@ def send_ntfy_notification(config: Config, title: str, message: str, url: Option
         raise
 
 
+def load_cookies(cookies_path: Path) -> list[dict]:
+    """Load cookies from a JSON file (standard browser-export format).
+
+    Expects a list of cookie objects with at minimum 'name', 'value', 'domain'.
+    Returns an empty list if the file doesn't exist.
+    """
+    if not cookies_path.exists():
+        logger.info(f"No cookies file at {cookies_path} — proceeding unauthenticated")
+        return []
+    with open(cookies_path) as f:
+        cookies = json.load(f)
+    logger.info(f"Loaded {len(cookies)} cookies from {cookies_path}")
+    return cookies
+
+
 _MOBILE_UA = (
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) '
     'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 '
@@ -233,7 +249,7 @@ def _extract_posts_from_html(html: str, page_name: str) -> list[dict]:
     return posts
 
 
-def scrape_with_requests(page_name: str) -> list[dict]:
+def scrape_with_requests(page_name: str, cookies: list[dict]) -> list[dict]:
     """Try fetching mbasic.facebook.com with a plain HTTP request (no browser)."""
     url = f"https://mbasic.facebook.com/{page_name}"
     logger.info(f"Attempting plain HTTP fetch: {url}")
@@ -245,18 +261,24 @@ def scrape_with_requests(page_name: str) -> list[dict]:
         'Accept-Language': 'en-GB,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
     })
+    for c in cookies:
+        session.cookies.set(
+            c['name'], c['value'],
+            domain=c.get('domain', '.facebook.com'),
+            path=c.get('path', '/'),
+        )
 
     resp = session.get(url, timeout=15, allow_redirects=True)
     logger.info(f"HTTP response: {resp.status_code}, final URL: {resp.url}")
 
     if 'login' in str(resp.url) or 'checkpoint' in str(resp.url):
-        logger.warning("Plain HTTP also hit login wall")
+        logger.warning("Plain HTTP hit login wall")
         return []
 
     return _extract_posts_from_html(resp.text, page_name)
 
 
-async def scrape_with_playwright(page_name: str) -> list[dict]:
+async def scrape_with_playwright(page_name: str, cookies: list[dict]) -> list[dict]:
     """Fallback: use Playwright headless browser against mbasic.facebook.com."""
     from playwright.async_api import async_playwright
 
@@ -274,6 +296,9 @@ async def scrape_with_playwright(page_name: str) -> list[dict]:
             locale='en-US',
             user_agent=_MOBILE_UA,
         )
+        if cookies:
+            await context.add_cookies(cookies)
+
         page = await context.new_page()
 
         try:
@@ -282,7 +307,7 @@ async def scrape_with_playwright(page_name: str) -> list[dict]:
             logger.info(f"Playwright page URL: {page.url}")
 
             if 'login' in page.url or 'checkpoint' in page.url:
-                logger.warning(f"Playwright also hit login wall: {page.url}")
+                logger.warning(f"Playwright hit login wall: {page.url}")
                 return posts
 
             html = await page.content()
@@ -296,22 +321,23 @@ async def scrape_with_playwright(page_name: str) -> list[dict]:
     return posts
 
 
-def scrape_facebook_page(page_name: str) -> list[dict]:
+def scrape_facebook_page(page_name: str, cookies: list[dict]) -> list[dict]:
     """Try plain HTTP first; fall back to Playwright if blocked."""
-    posts = scrape_with_requests(page_name)
+    posts = scrape_with_requests(page_name, cookies)
     if posts:
         return posts
 
     logger.info("Plain HTTP returned no posts, falling back to Playwright")
-    return asyncio.run(scrape_with_playwright(page_name))
+    return asyncio.run(scrape_with_playwright(page_name, cookies))
 
 
 def process_facebook_page(config: Config, seen_posts: SeenPosts):
     """Scrape Facebook page and process new posts."""
     logger.info(f"Checking Facebook page: {config.facebook_page}")
+    cookies = load_cookies(config.cookies_file)
 
     try:
-        posts = scrape_facebook_page(config.facebook_page)
+        posts = scrape_facebook_page(config.facebook_page, cookies)
     except Exception as e:
         logger.error(f"Failed to scrape Facebook page: {e}")
         raise
