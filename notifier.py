@@ -206,7 +206,16 @@ async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
             logger.info(f"Found {len(unique_hrefs)} unique post links")
 
             if not unique_hrefs:
-                logger.warning("No post links found - Facebook may have changed their HTML")
+                page_title = await page.title()
+                page_url = page.url
+                logger.warning(f"No post links found. Page title: '{page_title}', URL: {page_url}")
+                # Log a sample of hrefs seen to diagnose what links exist
+                sample_hrefs = []
+                for link in all_links[:30]:
+                    href = await link.get_attribute('href')
+                    if href and 'facebook.com' in href:
+                        sample_hrefs.append(href[:80])
+                logger.warning(f"Sample facebook.com hrefs on page: {sample_hrefs[:10]}")
                 return posts
 
             # Step 2: For each unique post link, find its article and extract content
