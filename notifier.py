@@ -153,11 +153,18 @@ async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
     logger.info(f"Opening Facebook page with headless browser: {url}")
 
     async with async_playwright() as p:
-        # Use Chromium headless
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--disable-blink-features=AutomationControlled'],
+        )
         context = await browser.new_context(
             viewport={'width': 1280, 'height': 800},
             locale='en-US',
+            user_agent=(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/125.0.0.0 Safari/537.36'
+            ),
         )
         page = await context.new_page()
 
@@ -168,8 +175,13 @@ async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
             # Wait a bit for dynamic content to load
             await page.wait_for_timeout(3000)
 
-            # Close any popups (login prompts, cookie banners)
+            logger.info(f"Page loaded. URL: {page.url}")
+
+            # Dismiss any login modal/overlay — press Escape first, then look for close buttons
             try:
+                await page.keyboard.press('Escape')
+                await page.wait_for_timeout(500)
+
                 # Click "Allow all cookies" button if present
                 allow_cookies = page.get_by_role("button", name="Allow all cookies")
                 if await allow_cookies.count() > 0:
@@ -177,13 +189,17 @@ async def scrape_facebook_with_playwright(page_name: str) -> list[dict]:
                     logger.info("Clicked 'Allow all cookies' button")
                     await page.wait_for_timeout(2000)
 
-                # Also close any other modals
-                close_buttons = await page.query_selector_all('[aria-label="Close"]')
-                for btn in close_buttons:
-                    await btn.click()
-                    await page.wait_for_timeout(500)
+                # Close any remaining modals
+                for selector in ['[aria-label="Close"]', '[aria-label="close"]']:
+                    close_buttons = await page.query_selector_all(selector)
+                    for btn in close_buttons:
+                        await btn.click()
+                        logger.info(f"Closed modal via {selector}")
+                        await page.wait_for_timeout(500)
             except Exception as e:
                 logger.debug(f"No popup to close: {e}")
+
+            logger.info(f"Post-dismiss URL: {page.url}")
 
             # Scroll down multiple times to load more posts
             for scroll_num in range(3):
