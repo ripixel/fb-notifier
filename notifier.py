@@ -164,14 +164,20 @@ def load_cookies(cookies_path: Path) -> list[dict]:
         cookies = json.load(f)
 
     # Playwright requires sameSite to be "Strict", "Lax", or "None" (capitalised).
-    # Browser export tools (e.g. Cookie-Editor) use "no_restriction" for None.
-    _same_site_map = {"no_restriction": "None", "unspecified": "None"}
+    # Browser export tools use "no_restriction", "lax", "strict", or null.
+    _same_site_map = {
+        "no_restriction": "None",
+        "unspecified": "None",
+        "none": "None",
+        "lax": "Lax",
+        "strict": "Strict",
+    }
     for c in cookies:
         raw = c.get("sameSite")
         if raw is None:
             c["sameSite"] = "None"
-        elif raw in _same_site_map:
-            c["sameSite"] = _same_site_map[raw]
+        else:
+            c["sameSite"] = _same_site_map.get(raw.lower(), raw)
 
     logger.info(f"Loaded {len(cookies)} cookies from {cookies_path}")
     return cookies
