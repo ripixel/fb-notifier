@@ -343,25 +343,9 @@ def scrape_facebook_page(page_name: str, cookies: list[dict]) -> list[dict]:
     return asyncio.run(scrape_with_playwright(page_name, cookies))
 
 
-def scrape_instagram(username: str, cookies: list[dict]) -> list[dict]:
-    """Fetch recent posts from a public Instagram profile using the web API."""
+def _build_instagram_session(cookies: list[dict]) -> requests.Session:
+    """Build a requests Session pre-loaded with Instagram cookies and headers."""
     session = requests.Session()
-
-    # Instagram's internal app ID for the web client
-    _IG_APP_ID = "936619743392459"
-
-    session.headers.update({
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/125.0.0.0 Safari/537.36'
-        ),
-        'Accept': '*/*',
-        'Accept-Language': 'en-GB,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate',
-        'X-IG-App-ID': _IG_APP_ID,
-        'Referer': 'https://www.instagram.com/',
-    })
     csrf_token = ""
     for c in cookies:
         session.cookies.set(
@@ -372,59 +356,168 @@ def scrape_instagram(username: str, cookies: list[dict]) -> list[dict]:
         if c['name'] == 'csrftoken':
             csrf_token = c['value']
 
+    session.headers.update({
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/125.0.0.0 Safari/537.36'
+        ),
+        'Accept': '*/*',
+        'Accept-Language': 'en-GB,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate',
+        'X-IG-App-ID': '936619743392459',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Origin': 'https://www.instagram.com',
+        'Referer': 'https://www.instagram.com/',
+    })
     if csrf_token:
         session.headers['X-CSRFToken'] = csrf_token
-    if cookies:
-        logger.info(f"Using {len(cookies)} Instagram cookies, csrf={'yes' if csrf_token else 'no'}")
+    return session
 
-    # Use the web_profile_info API — returns clean JSON with recent posts
-    api_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
-    logger.info(f"Fetching Instagram profile via API: {api_url}")
 
-    resp = session.get(api_url, timeout=15)
-    logger.info(f"Instagram API response: {resp.status_code}, final URL: {resp.url}")
-
-    if resp.status_code != 200:
-        logger.warning(f"Instagram API returned {resp.status_code}: {resp.text[:500]}")
-        logger.warning(f"Response headers: {dict(resp.headers)}")
-        return []
-
-    try:
-        data = resp.json()
-    except Exception as e:
-        logger.error(f"Failed to parse Instagram API response as JSON: {e}")
-        logger.warning(f"Response snippet: {resp.text[:300]}")
-        return []
-
+def _parse_instagram_api_response(data: dict) -> list[dict]:
+    """Extract post list from web_profile_info API JSON."""
     edges = (
         data.get("data", {})
             .get("user", {})
             .get("edge_owner_to_timeline_media", {})
             .get("edges", [])
     )
-    logger.info(f"Found {len(edges)} posts from API")
-
     posts = []
     for edge in edges[:10]:
         node = edge.get("node", {})
         shortcode = node.get("shortcode")
         if not shortcode:
             continue
-
-        # Caption is nested under edge_media_to_caption.edges[0].node.text
         caption = ""
         cap_edges = node.get("edge_media_to_caption", {}).get("edges", [])
         if cap_edges:
             caption = cap_edges[0].get("node", {}).get("text", "")
-
         posts.append({
             'post_url': f"https://www.instagram.com/p/{shortcode}/",
             'text': caption[:1000],
             'image_url': node.get("thumbnail_src") or node.get("display_url"),
         })
         logger.info(f"Post {shortcode}: {caption[:60]}...")
+    return posts
+
+
+async def _scrape_instagram_playwright(username: str, cookies: list[dict]) -> list[dict]:
+    """Playwright fallback: render instagram.com in a real browser and extract post links."""
+    from playwright.async_api import async_playwright
+
+    url = f"https://www.instagram.com/{username}/"
+    posts = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--disable-blink-features=AutomationControlled'],
+        )
+        context = await browser.new_context(
+            viewport={'width': 1280, 'height': 800},
+            locale='en-US',
+            user_agent=(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/125.0.0.0 Safari/537.36'
+            ),
+        )
+
+        if cookies:
+            pw_cookies = []
+            for c in cookies:
+                pw_cookie = {
+                    'name': c['name'],
+                    'value': c['value'],
+                    'domain': c.get('domain', '.instagram.com'),
+                    'path': c.get('path', '/'),
+                    'secure': c.get('secure', True),
+                    'httpOnly': c.get('httpOnly', False),
+                    'sameSite': c.get('sameSite', 'None'),
+                }
+                pw_cookies.append(pw_cookie)
+            await context.add_cookies(pw_cookies)
+
+        page = await context.new_page()
+        try:
+            logger.info(f"Playwright Instagram: navigating to {url}")
+            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            await page.wait_for_timeout(3000)
+
+            current_url = page.url
+            logger.info(f"Playwright Instagram: final URL: {current_url}")
+
+            if 'accounts/login' in current_url or 'challenge' in current_url:
+                logger.warning(f"Playwright Instagram: hit login wall: {current_url}")
+                return posts
+
+            # Wait for post links to appear in the React-rendered DOM
+            try:
+                await page.wait_for_selector('a[href*="/p/"]', timeout=10000)
+            except Exception:
+                logger.warning("Playwright Instagram: no post links appeared within timeout")
+
+            links = await page.evaluate('''() => {
+                const anchors = document.querySelectorAll('a[href*="/p/"]');
+                const seen = new Set();
+                const results = [];
+                for (const a of anchors) {
+                    const href = a.getAttribute('href');
+                    const match = href.match(/\\/p\\/([A-Za-z0-9_-]+)\\//);
+                    if (match && !seen.has(match[1])) {
+                        seen.add(match[1]);
+                        results.push(match[1]);
+                    }
+                    if (results.length >= 10) break;
+                }
+                return results;
+            }''')
+
+            logger.info(f"Playwright Instagram: found {len(links)} post shortcodes")
+            for sc in links:
+                posts.append({
+                    'post_url': f"https://www.instagram.com/p/{sc}/",
+                    'text': '',
+                    'image_url': None,
+                })
+
+        except Exception as e:
+            logger.error(f"Playwright Instagram error: {e}")
+        finally:
+            await browser.close()
 
     return posts
+
+
+def scrape_instagram(username: str, cookies: list[dict]) -> list[dict]:
+    """Fetch recent posts from an Instagram profile.
+
+    Tries the internal web_profile_info JSON API first (fast, has captions).
+    Falls back to Playwright rendering www.instagram.com if the API is blocked.
+    """
+    if cookies:
+        logger.info(f"Using {len(cookies)} Instagram cookies")
+
+    session = _build_instagram_session(cookies)
+
+    # Primary: i.instagram.com internal API
+    api_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    logger.info(f"Trying Instagram API: {api_url}")
+    try:
+        resp = session.get(api_url, timeout=15)
+        logger.info(f"Instagram API response: {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            posts = _parse_instagram_api_response(data)
+            logger.info(f"API returned {len(posts)} posts")
+            return posts
+        logger.warning(f"Instagram API returned {resp.status_code} — falling back to Playwright")
+    except Exception as e:
+        logger.warning(f"Instagram API request failed: {e} — falling back to Playwright")
+
+    # Fallback: Playwright rendering of www.instagram.com
+    return asyncio.run(_scrape_instagram_playwright(username, cookies))
 
 
 def process_page(config: Config, seen_posts: SeenPosts):
