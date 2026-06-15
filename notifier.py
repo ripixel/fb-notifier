@@ -167,8 +167,11 @@ def load_cookies(cookies_path: Path) -> list[dict]:
     # Browser export tools (e.g. Cookie-Editor) use "no_restriction" for None.
     _same_site_map = {"no_restriction": "None", "unspecified": "None"}
     for c in cookies:
-        if "sameSite" in c:
-            c["sameSite"] = _same_site_map.get(c["sameSite"], c["sameSite"])
+        raw = c.get("sameSite")
+        if raw is None:
+            c["sameSite"] = "None"
+        elif raw in _same_site_map:
+            c["sameSite"] = _same_site_map[raw]
 
     logger.info(f"Loaded {len(cookies)} cookies from {cookies_path}")
     return cookies
