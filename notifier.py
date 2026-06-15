@@ -362,14 +362,20 @@ def scrape_instagram(username: str, cookies: list[dict]) -> list[dict]:
         'X-IG-App-ID': _IG_APP_ID,
         'Referer': 'https://www.instagram.com/',
     })
+    csrf_token = ""
     for c in cookies:
         session.cookies.set(
             c['name'], c['value'],
             domain=c.get('domain', '.instagram.com'),
             path=c.get('path', '/'),
         )
+        if c['name'] == 'csrftoken':
+            csrf_token = c['value']
+
+    if csrf_token:
+        session.headers['X-CSRFToken'] = csrf_token
     if cookies:
-        logger.info(f"Using {len(cookies)} Instagram cookies")
+        logger.info(f"Using {len(cookies)} Instagram cookies, csrf={'yes' if csrf_token else 'no'}")
 
     # Use the web_profile_info API — returns clean JSON with recent posts
     api_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
@@ -379,7 +385,8 @@ def scrape_instagram(username: str, cookies: list[dict]) -> list[dict]:
     logger.info(f"Instagram API response: {resp.status_code}, final URL: {resp.url}")
 
     if resp.status_code != 200:
-        logger.warning(f"Instagram API returned {resp.status_code}: {resp.text[:300]}")
+        logger.warning(f"Instagram API returned {resp.status_code}: {resp.text[:500]}")
+        logger.warning(f"Response headers: {dict(resp.headers)}")
         return []
 
     try:
