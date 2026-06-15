@@ -268,8 +268,12 @@ def scrape_with_requests(page_name: str, cookies: list[dict]) -> list[dict]:
             path=c.get('path', '/'),
         )
 
+    # Check the initial response without following redirects first
+    probe = session.get(url, timeout=15, allow_redirects=False)
+    logger.info(f"Initial HTTP response: {probe.status_code}, Location: {probe.headers.get('Location', 'none')}")
+
     resp = session.get(url, timeout=15, allow_redirects=True)
-    logger.info(f"HTTP response: {resp.status_code}, final URL: {resp.url}")
+    logger.info(f"Final HTTP response: {resp.status_code}, final URL: {resp.url}")
 
     if 'login' in str(resp.url) or 'checkpoint' in str(resp.url):
         logger.warning("Plain HTTP hit login wall")
