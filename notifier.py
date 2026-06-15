@@ -43,6 +43,7 @@ class Config:
             data = json.load(f)
 
         self.facebook_page = data.get("facebook_page", "newarkparkrun")
+        self.instagram_page = data.get("instagram_page")
         self.ntfy_topic = data["ntfy_topic"]
         self.ntfy_server = data.get("ntfy_server", "https://ntfy.sh")
         self.seen_posts_file = Path(data.get("seen_posts_file", "./seen_posts.json"))
@@ -75,27 +76,26 @@ class SeenPosts:
 
 
 def generate_post_id(post_url: str, text: str) -> Optional[str]:
-    """Extract a stable post ID from a Facebook permalink URL."""
-    # Modern pfbid format
+    """Extract a stable post ID from a Facebook or Instagram URL."""
+    # Instagram shortcode: /p/<shortcode>/
+    match = re.search(r'/p/([A-Za-z0-9_-]{9,})/', post_url)
+    if match:
+        return f"ig_{match.group(1)}"
+
+    # Facebook pfbid format
     match = re.search(r'/posts/(pfbid\w+)', post_url)
     if match:
-        post_id = match.group(1)
-        logger.info(f"Found pfbid post ID: {post_id[:20]}...")
-        return post_id
+        return match.group(1)
 
-    # Numeric post ID in path (mbasic sometimes uses these)
+    # Facebook numeric post ID
     match = re.search(r'/posts/(\d+)', post_url)
     if match:
-        post_id = match.group(1)
-        logger.info(f"Found numeric post ID: {post_id[:20]}...")
-        return post_id
+        return match.group(1)
 
-    # story_fbid format (mbasic story.php links)
+    # Facebook story.php
     match = re.search(r'story_fbid=(\d+)', post_url)
     if match:
-        post_id = f"story_{match.group(1)}"
-        logger.info(f"Found story_fbid post ID: {post_id[:20]}...")
-        return post_id
+        return f"story_{match.group(1)}"
 
     logger.debug(f"No valid post ID found in URL: {post_url[:60]}...")
     return None
@@ -339,16 +339,83 @@ def scrape_facebook_page(page_name: str, cookies: list[dict]) -> list[dict]:
     return asyncio.run(scrape_with_playwright(page_name, cookies))
 
 
-def process_facebook_page(config: Config, seen_posts: SeenPosts):
-    """Scrape Facebook page and process new posts."""
-    logger.info(f"Checking Facebook page: {config.facebook_page}")
-    cookies = load_cookies(config.cookies_file)
+def scrape_instagram(username: str) -> list[dict]:
+    """Fetch recent posts from a public Instagram profile via plain HTTP."""
+    url = f"https://www.instagram.com/{username}/"
+    logger.info(f"Fetching Instagram profile: {url}")
 
-    try:
-        posts = scrape_facebook_page(config.facebook_page, cookies)
-    except Exception as e:
-        logger.error(f"Failed to scrape Facebook page: {e}")
-        raise
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/125.0.0.0 Safari/537.36'
+        ),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-GB,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1',
+    })
+
+    resp = session.get(url, timeout=15, allow_redirects=True)
+    logger.info(f"Instagram response: {resp.status_code}, final URL: {resp.url}")
+
+    if resp.status_code != 200 or 'login' in str(resp.url) or 'accounts/login' in resp.text[:2000]:
+        logger.warning("Instagram hit login wall or was blocked")
+        # Log a snippet to help diagnose
+        logger.warning(f"Response snippet: {resp.text[:300]}")
+        return []
+
+    # Instagram embeds post data as JSON in <script> tags.
+    # Extract shortcodes — these are the unique post IDs (e.g. "C1abc23DEF")
+    shortcodes = list(dict.fromkeys(re.findall(r'"shortcode"\s*:\s*"([A-Za-z0-9_-]{9,})"', resp.text)))
+    logger.info(f"Found {len(shortcodes)} post shortcodes")
+
+    if not shortcodes:
+        # Log a diagnostic snippet so we can see what Instagram returned
+        logger.warning(f"No shortcodes found. Page title snippet: {resp.text[:500]}")
+
+    posts = []
+    for sc in shortcodes[:10]:
+        # Try to pull caption text from the same JSON blob
+        caption = ""
+        cap_match = re.search(
+            rf'"shortcode"\s*:\s*"{re.escape(sc)}".*?"text"\s*:\s*"((?:[^"\\]|\\.)*)"',
+            resp.text,
+        )
+        if cap_match:
+            caption = cap_match.group(1).encode().decode('unicode_escape', errors='replace')[:500]
+
+        posts.append({
+            'post_url': f"https://www.instagram.com/p/{sc}/",
+            'text': caption,
+            'image_url': None,
+        })
+
+    return posts
+
+
+def process_page(config: Config, seen_posts: SeenPosts):
+    """Scrape the configured source (Instagram or Facebook) and send notifications."""
+    if config.instagram_page:
+        logger.info(f"Checking Instagram page: {config.instagram_page}")
+        try:
+            posts = scrape_instagram(config.instagram_page)
+        except Exception as e:
+            logger.error(f"Failed to scrape Instagram page: {e}")
+            raise
+    else:
+        logger.info(f"Checking Facebook page: {config.facebook_page}")
+        cookies = load_cookies(config.cookies_file)
+        try:
+            posts = scrape_facebook_page(config.facebook_page, cookies)
+        except Exception as e:
+            logger.error(f"Failed to scrape Facebook page: {e}")
+            raise
 
     if not posts:
         logger.info("No posts found on page")
@@ -357,7 +424,6 @@ def process_facebook_page(config: Config, seen_posts: SeenPosts):
     logger.info(f"Found {len(posts)} posts to check")
     new_posts = 0
 
-    # Process in reverse (oldest first) for chronological notifications
     for post in reversed(posts):
         post_id = generate_post_id(post['post_url'], post['text'])
 
@@ -369,24 +435,19 @@ def process_facebook_page(config: Config, seen_posts: SeenPosts):
             logger.debug(f"Already seen post: {post_id}")
             continue
 
-        if len(post['text']) < 10:
-            logger.debug(f"Marking post seen without notification (no text): {post_id[:20]}...")
-            seen_posts.mark_seen(post_id)
-            continue
-
-        # Create notification
-        first_line = post['text'].split('\n')[0][:50] if post['text'] else 'New Post'
+        # For Instagram we may have no caption — still notify, just with the URL
+        first_line = post['text'].split('\n')[0][:50] if post['text'] else 'New post'
         title = f"Newark Parkrun: {first_line}"
-        message = post['text'][:500] + ("..." if len(post['text']) > 500 else "")
+        message = post['text'][:500] + ("..." if len(post['text']) > 500 else "") if post['text'] else post['post_url']
 
-        logger.info(f"New post found: {first_line}")
+        logger.info(f"New post found: {post['post_url']}")
 
         send_ntfy_notification(
             config,
             title=title,
             message=message,
             url=post['post_url'],
-            image_url=post.get('image_url')
+            image_url=post.get('image_url'),
         )
 
         seen_posts.mark_seen(post_id)
@@ -410,14 +471,14 @@ def main():
 
     if run_once:
         try:
-            process_facebook_page(config, seen_posts)
+            process_page(config, seen_posts)
         except Exception as e:
             logger.exception(f"Unexpected error: {e}")
         return
 
     while True:
         try:
-            process_facebook_page(config, seen_posts)
+            process_page(config, seen_posts)
         except Exception as e:
             logger.exception(f"Unexpected error: {e}")
 
