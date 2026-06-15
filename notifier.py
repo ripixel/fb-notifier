@@ -48,6 +48,7 @@ class Config:
         self.ntfy_server = data.get("ntfy_server", "https://ntfy.sh")
         self.seen_posts_file = Path(data.get("seen_posts_file", "./seen_posts.json"))
         self.cookies_file = Path(data.get("cookies_file", "./cookies.json"))
+        self.instagram_cookies_file = Path(data.get("instagram_cookies_file", "./instagram_cookies.json"))
 
 
 class SeenPosts:
@@ -339,7 +340,7 @@ def scrape_facebook_page(page_name: str, cookies: list[dict]) -> list[dict]:
     return asyncio.run(scrape_with_playwright(page_name, cookies))
 
 
-def scrape_instagram(username: str) -> list[dict]:
+def scrape_instagram(username: str, cookies: list[dict]) -> list[dict]:
     """Fetch recent posts from a public Instagram profile via plain HTTP."""
     url = f"https://www.instagram.com/{username}/"
     logger.info(f"Fetching Instagram profile: {url}")
@@ -360,6 +361,14 @@ def scrape_instagram(username: str) -> list[dict]:
         'Sec-Fetch-User': '?1',
         'Upgrade-Insecure-Requests': '1',
     })
+    for c in cookies:
+        session.cookies.set(
+            c['name'], c['value'],
+            domain=c.get('domain', '.instagram.com'),
+            path=c.get('path', '/'),
+        )
+    if cookies:
+        logger.info(f"Using {len(cookies)} Instagram cookies")
 
     resp = session.get(url, timeout=15, allow_redirects=True)
     logger.info(f"Instagram response: {resp.status_code}, final URL: {resp.url}")
@@ -403,8 +412,9 @@ def process_page(config: Config, seen_posts: SeenPosts):
     """Scrape the configured source (Instagram or Facebook) and send notifications."""
     if config.instagram_page:
         logger.info(f"Checking Instagram page: {config.instagram_page}")
+        ig_cookies = load_cookies(config.instagram_cookies_file)
         try:
-            posts = scrape_instagram(config.instagram_page)
+            posts = scrape_instagram(config.instagram_page, ig_cookies)
         except Exception as e:
             logger.error(f"Failed to scrape Instagram page: {e}")
             raise

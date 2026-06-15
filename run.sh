@@ -11,6 +11,7 @@ gsutil cp ${BUCKET}/seen_posts.json /app/seen_posts.json 2>/dev/null || echo '{"
 
 echo "Downloading cookies from GCS (if exists)..."
 gsutil cp ${BUCKET}/cookies.json /app/cookies.json 2>/dev/null || true
+gsutil cp ${BUCKET}/instagram_cookies.json /app/instagram_cookies.json 2>/dev/null || true
 
 echo "Running notifier..."
 python notifier.py --once
