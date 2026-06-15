@@ -344,25 +344,23 @@ def scrape_facebook_page(page_name: str, cookies: list[dict]) -> list[dict]:
 
 
 def scrape_instagram(username: str, cookies: list[dict]) -> list[dict]:
-    """Fetch recent posts from a public Instagram profile via plain HTTP."""
-    url = f"https://www.instagram.com/{username}/"
-    logger.info(f"Fetching Instagram profile: {url}")
-
+    """Fetch recent posts from a public Instagram profile using the web API."""
     session = requests.Session()
+
+    # Instagram's internal app ID for the web client
+    _IG_APP_ID = "936619743392459"
+
     session.headers.update({
         'User-Agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
             'AppleWebKit/537.36 (KHTML, like Gecko) '
             'Chrome/125.0.0.0 Safari/537.36'
         ),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept': '*/*',
         'Accept-Language': 'en-GB,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
+        'X-IG-App-ID': _IG_APP_ID,
+        'Referer': 'https://www.instagram.com/',
     })
     for c in cookies:
         session.cookies.set(
@@ -373,40 +371,51 @@ def scrape_instagram(username: str, cookies: list[dict]) -> list[dict]:
     if cookies:
         logger.info(f"Using {len(cookies)} Instagram cookies")
 
-    resp = session.get(url, timeout=15, allow_redirects=True)
-    logger.info(f"Instagram response: {resp.status_code}, final URL: {resp.url}")
+    # Use the web_profile_info API — returns clean JSON with recent posts
+    api_url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    logger.info(f"Fetching Instagram profile via API: {api_url}")
 
-    if resp.status_code != 200 or 'login' in str(resp.url) or 'accounts/login' in resp.text[:2000]:
-        logger.warning("Instagram hit login wall or was blocked")
-        # Log a snippet to help diagnose
+    resp = session.get(api_url, timeout=15)
+    logger.info(f"Instagram API response: {resp.status_code}, final URL: {resp.url}")
+
+    if resp.status_code != 200:
+        logger.warning(f"Instagram API returned {resp.status_code}: {resp.text[:300]}")
+        return []
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.error(f"Failed to parse Instagram API response as JSON: {e}")
         logger.warning(f"Response snippet: {resp.text[:300]}")
         return []
 
-    # Instagram embeds post data as JSON in <script> tags.
-    # Extract shortcodes — these are the unique post IDs (e.g. "C1abc23DEF")
-    shortcodes = list(dict.fromkeys(re.findall(r'"shortcode"\s*:\s*"([A-Za-z0-9_-]{9,})"', resp.text)))
-    logger.info(f"Found {len(shortcodes)} post shortcodes")
-
-    if not shortcodes:
-        # Log a diagnostic snippet so we can see what Instagram returned
-        logger.warning(f"No shortcodes found. Page title snippet: {resp.text[:500]}")
+    edges = (
+        data.get("data", {})
+            .get("user", {})
+            .get("edge_owner_to_timeline_media", {})
+            .get("edges", [])
+    )
+    logger.info(f"Found {len(edges)} posts from API")
 
     posts = []
-    for sc in shortcodes[:10]:
-        # Try to pull caption text from the same JSON blob
+    for edge in edges[:10]:
+        node = edge.get("node", {})
+        shortcode = node.get("shortcode")
+        if not shortcode:
+            continue
+
+        # Caption is nested under edge_media_to_caption.edges[0].node.text
         caption = ""
-        cap_match = re.search(
-            rf'"shortcode"\s*:\s*"{re.escape(sc)}".*?"text"\s*:\s*"((?:[^"\\]|\\.)*)"',
-            resp.text,
-        )
-        if cap_match:
-            caption = cap_match.group(1).encode().decode('unicode_escape', errors='replace')[:500]
+        cap_edges = node.get("edge_media_to_caption", {}).get("edges", [])
+        if cap_edges:
+            caption = cap_edges[0].get("node", {}).get("text", "")
 
         posts.append({
-            'post_url': f"https://www.instagram.com/p/{sc}/",
-            'text': caption,
-            'image_url': None,
+            'post_url': f"https://www.instagram.com/p/{shortcode}/",
+            'text': caption[:1000],
+            'image_url': node.get("thumbnail_src") or node.get("display_url"),
         })
+        logger.info(f"Post {shortcode}: {caption[:60]}...")
 
     return posts
 
